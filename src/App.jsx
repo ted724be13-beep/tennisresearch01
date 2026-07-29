@@ -1,9 +1,24 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { 
-  Users, Activity, PlusCircle, FileSpreadsheet, Save, Trash2, Home, Upload, Eye, X, Lock, Unlock, AlertTriangle
+  Users, Activity, PlusCircle, FileSpreadsheet, Save, Trash2, Home, Upload, Eye, X, Lock, Unlock, AlertTriangle, BarChart2, Cloud as CloudIcon
 } from 'lucide-react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from 'firebase/auth';
+import { getFirestore, collection, doc, setDoc, deleteDoc, onSnapshot } from 'firebase/firestore';
 
-// --- Utility Functions for Calculations ---
+let app, auth, db, appId;
+try {
+  const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+  if (firebaseConfig && Object.keys(firebaseConfig).length > 0) {
+    app = initializeApp(firebaseConfig);
+    auth = getAuth(app);
+    db = getFirestore(app);
+    appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+  }
+} catch (e) {
+  console.error("Firebase init failed, running locally:", e);
+}
+
 const calcMean = (arr) => {
   const valid = arr.filter(n => n !== null && n !== '' && !isNaN(n));
   if (valid.length === 0) return null;
@@ -30,7 +45,46 @@ const calcTotalROM = (irMean, erMean) => {
   return null;
 };
 
-// --- 定義 K-Pull 完整 28 項擷取指標 ---
+const calculateANOVA = (groups) => {
+  const validGroups = groups.filter(g => g.length > 0);
+  if (validGroups.length < 2) return null;
+
+  let totalSum = 0;
+  let totalCount = 0;
+  validGroups.forEach(g => {
+    totalSum += g.reduce((a,b)=>a+b, 0);
+    totalCount += g.length;
+  });
+  const overallMean = totalSum / totalCount;
+
+  let ssb = 0; 
+  let ssw = 0; 
+
+  validGroups.forEach(g => {
+    const groupMean = g.reduce((a,b)=>a+b, 0) / g.length;
+    ssb += g.length * Math.pow(groupMean - overallMean, 2);
+    g.forEach(val => {
+      ssw += Math.pow(val - groupMean, 2);
+    });
+  });
+
+  const dfB = validGroups.length - 1;
+  const dfW = totalCount - validGroups.length;
+
+  if (dfW === 0 || dfB === 0 || ssw === 0) return null;
+
+  const msb = ssb / dfB;
+  const msw = ssw / dfW;
+  const fScore = msb / msw;
+
+  if (window.jStat) {
+    try {
+      return 1 - window.jStat.centralF.cdf(fScore, dfB, dfW);
+    } catch(e) { return null; }
+  }
+  return null;
+};
+
 const kpullMetricsList = [
   "Max Value (kg)", "Average Value (kg)", "RFD To Max (kg/s)", "RFD From Max (kg/s)",
   "RFD 20% - 80% Fmax (kg/s)", "Average RFD (kg/s)", "Time To Max (sec)",
@@ -43,12 +97,11 @@ const kpullMetricsList = [
   "Force at 50ms (kg)", "Force at 100ms (kg)", "Force at 250ms (kg)"
 ];
 
-// --- Initial Data Structures ---
 const initialRomState = () => ({
-  activeLeftIR: ['', '', ''], activeLeftER: ['', '', ''],
-  activeRightIR: ['', '', ''], activeRightER: ['', '', ''],
-  passiveLeftIR: ['', '', ''], passiveLeftER: ['', '', ''],
-  passiveRightIR: ['', '', ''], passiveRightER: ['', '', ''],
+  activeRightIR: ['', '', ''], passiveRightIR: ['', '', ''],
+  activeRightER: ['', '', ''], passiveRightER: ['', '', ''],
+  activeLeftIR: ['', '', ''], passiveLeftIR: ['', '', ''],
+  activeLeftER: ['', '', ''], passiveLeftER: ['', '', ''],
   thoracicLeft: ['', '', ''], thoracicRight: ['', '', '']
 });
 
@@ -82,10 +135,8 @@ const emptySubject = {
   kpull: initialKPullState()
 };
 
-// --- Domain Configuration ---
 const getQuestions = (subject) => {
   const q = [
-    // Domain: 基本資料
     { id: 'subjectNo', domain: 'basic', type: 'text', label: '受試者編號', placeholder: '' },
     { id: 'name', domain: 'basic', type: 'text', label: '姓名', placeholder: '' },
     { id: 'gender', domain: 'basic', type: 'select', label: '性別', options: ['男性', '女性'] },
@@ -106,26 +157,25 @@ const getQuestions = (subject) => {
     q.push({ id: 'painVas', domain: 'basic', type: 'number', label: '最近一週最大疼痛程度 (VAS 1-10)', min: 1, max: 10, placeholder: '' });
   }
 
-  // Domain: 關節活動度 (ROM)
   q.push(
     { id: 'activeRightIR', domain: 'rom', type: 'trials', label: '主動肩關節: 右側內轉 (R-IR)', path: 'rom' },
-    { id: 'activeRightER', domain: 'rom', type: 'trials', label: '主動肩關節: 右側外轉 (R-ER)', path: 'rom' },
-    { id: 'activeLeftIR', domain: 'rom', type: 'trials', label: '主動肩關節: 左側內轉 (L-IR)', path: 'rom' },
-    { id: 'activeLeftER', domain: 'rom', type: 'trials', label: '主動肩關節: 左側外轉 (L-ER)', path: 'rom' },
     { id: 'passiveRightIR', domain: 'rom', type: 'trials', label: '被動肩關節: 右側內轉 (R-IR)', path: 'rom' },
+    { id: 'activeRightER', domain: 'rom', type: 'trials', label: '主動肩關節: 右側外轉 (R-ER)', path: 'rom' },
     { id: 'passiveRightER', domain: 'rom', type: 'trials', label: '被動肩關節: 右側外轉 (R-ER)', path: 'rom' },
+    
+    { id: 'activeLeftIR', domain: 'rom', type: 'trials', label: '主動肩關節: 左側內轉 (L-IR)', path: 'rom' },
     { id: 'passiveLeftIR', domain: 'rom', type: 'trials', label: '被動肩關節: 左側內轉 (L-IR)', path: 'rom' },
+    { id: 'activeLeftER', domain: 'rom', type: 'trials', label: '主動肩關節: 左側外轉 (L-ER)', path: 'rom' },
     { id: 'passiveLeftER', domain: 'rom', type: 'trials', label: '被動肩關節: 左側外轉 (L-ER)', path: 'rom' },
+    
     { id: 'thoracicRight', domain: 'rom', type: 'trials', label: '胸椎: 向右旋轉', path: 'rom' },
     { id: 'thoracicLeft', domain: 'rom', type: 'trials', label: '胸椎: 向左旋轉', path: 'rom' }
   );
 
-  // Domain: 動作控制 (SMRT)
   q.push(
     { id: 'smrt', domain: 'smrt', type: 'smrt', label: '肩膀內轉動作控制 (SMRT)' }
   );
 
-  // Domain: 功能測試 (Functional)
   q.push(
     { id: 'medial', domain: 'functional', type: 'trials', label: 'YBT-UQ: Medial', path: 'ybt' },
     { id: 'sl', domain: 'functional', type: 'trials', label: 'YBT-UQ: Superolateral (SL)', path: 'ybt' },
@@ -133,7 +183,6 @@ const getQuestions = (subject) => {
     { id: 'setDuration', domain: 'functional', type: 'number', label: '後側肩膀肌肉耐力測試 (SET) 持續秒數', step: '0.1' }
   );
 
-  // Domain: K-Pull
   q.push(
     { id: 'kpull_upload', domain: 'kpull', type: 'kpull_upload', label: 'K-Pull 數據上傳' }
   );
@@ -149,7 +198,6 @@ const domains = [
   { id: 'kpull', label: '📈 K-Pull' }
 ];
 
-// --- UI Components ---
 const Dashboard = ({ subjects, setView, handleStartNew }) => {
   const total = subjects.length;
   const groupCount = subjects.reduce((acc, s) => {
@@ -194,7 +242,114 @@ const Dashboard = ({ subjects, setView, handleStartNew }) => {
         >
           <Users size={20} /> 個案資料管理
         </button>
+        <button 
+          onClick={() => setView('analysis')}
+          disabled={total < 2}
+          className={`flex-1 p-4 rounded-xl font-medium flex items-center justify-center gap-2 transition-colors ${total < 2 ? 'bg-gray-100 text-gray-400 cursor-not-allowed' : 'bg-indigo-600 hover:bg-indigo-700 text-white'}`}
+        >
+          <BarChart2 size={20} /> 組間顯著性分析
+        </button>
       </div>
+    </div>
+  );
+};
+
+const AnalysisView = ({ subjects, setView }) => {
+  const [analyzedData, setAnalyzedData] = useState([]);
+
+  useEffect(() => {
+    const extractors = [
+      { name: '年齡 (yr)', get: s => s.age },
+      { name: '身高 (cm)', get: s => s.height },
+      { name: '體重 (kg)', get: s => s.weight },
+      { name: 'ROM 主動右側總和', get: s => calcTotalROM(calcMean(s.rom.activeRightIR), calcMean(s.rom.activeRightER)) },
+      { name: 'ROM 主動左側總和', get: s => calcTotalROM(calcMean(s.rom.activeLeftIR), calcMean(s.rom.activeLeftER)) },
+      { name: 'YBT 綜合標準化分數', get: s => {
+          if (!s.armLength) return null;
+          const m = calcMean(s.ybt.medial), il = calcMean(s.ybt.il), sl = calcMean(s.ybt.sl);
+          if(m && il && sl) return ((Number(m) + Number(il) + Number(sl)) / (3 * Number(s.armLength))) * 100;
+          return null;
+        } 
+      },
+      { name: 'K-Pull ER Max 標準化 %BW', get: s => {
+          const mean = calcMean(s.kpull['ER_Max Value (kg)']);
+          return (mean && s.weight) ? (Number(mean) / Number(s.weight)) * 100 : null;
+        } 
+      },
+      { name: 'K-Pull IR Max 標準化 %BW', get: s => {
+          const mean = calcMean(s.kpull['IR_Max Value (kg)']);
+          return (mean && s.weight) ? (Number(mean) / Number(s.weight)) * 100 : null;
+        } 
+      }
+    ];
+
+    const results = extractors.map(ext => {
+      const gHealth = [], gPain = [], gHistory = [];
+      subjects.forEach(sub => {
+        const val = ext.get(sub);
+        if (val !== null && val !== '' && !isNaN(val)) {
+          if (sub.group === '健康組') gHealth.push(Number(val));
+          else if (sub.group === '肩峰下疼痛組') gPain.push(Number(val));
+          else if (sub.group === '肩痛病史組') gHistory.push(Number(val));
+        }
+      });
+
+      const meanSdStr = (arr) => arr.length > 0 ? `${calcMean(arr)} ± ${calcSD(arr) || '0'}` : '-';
+      const pValue = calculateANOVA([gHealth, gPain, gHistory]);
+
+      return {
+        name: ext.name,
+        healthStr: meanSdStr(gHealth),
+        painStr: meanSdStr(gPain),
+        historyStr: meanSdStr(gHistory),
+        pValue: pValue !== null ? pValue : null
+      };
+    });
+
+    setAnalyzedData(results);
+  }, [subjects]);
+
+  return (
+    <div className="space-y-6 animate-in fade-in">
+      <div className="flex justify-between items-center gap-4">
+        <h2 className="text-2xl font-bold text-gray-800 flex items-center gap-2">
+          <BarChart2 className="text-indigo-600" /> 組間顯著性分析 (One-Way ANOVA)
+        </h2>
+        <button onClick={() => setView('dashboard')} className="p-2 border rounded-lg text-gray-600 hover:bg-gray-50">
+          <Home size={20} />
+        </button>
+      </div>
+
+      <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-x-auto">
+        <table className="w-full text-left border-collapse min-w-[600px]">
+          <thead>
+            <tr className="bg-gray-50 text-gray-600 text-sm border-b">
+              <th className="p-4">比較參數</th>
+              <th className="p-4">健康組 (Mean ± SD)</th>
+              <th className="p-4">肩峰下疼痛組</th>
+              <th className="p-4">肩痛病史組</th>
+              <th className="p-4 font-bold text-indigo-700">P-value</th>
+            </tr>
+          </thead>
+          <tbody>
+            {analyzedData.map((row, idx) => {
+              const isSignificant = row.pValue !== null && row.pValue < 0.05;
+              return (
+                <tr key={idx} className={`border-b last:border-0 hover:bg-gray-50 transition ${isSignificant ? 'bg-red-50/50' : ''}`}>
+                  <td className="p-4 font-medium text-gray-900">{row.name}</td>
+                  <td className="p-4 text-sm text-gray-700">{row.healthStr}</td>
+                  <td className="p-4 text-sm text-gray-700">{row.painStr}</td>
+                  <td className="p-4 text-sm text-gray-700">{row.historyStr}</td>
+                  <td className={`p-4 font-bold ${isSignificant ? 'text-red-600' : 'text-gray-500'}`}>
+                    {row.pValue !== null ? row.pValue.toFixed(4) : '-'}
+                  </td>
+                </tr>
+              )
+            })}
+          </tbody>
+        </table>
+      </div>
+      <p className="text-sm text-gray-500">※ 採用 One-Way ANOVA 檢定，紅色標示代表該參數在三組間具備統計上的顯著差異 ($p &lt; 0.05$)。</p>
     </div>
   );
 };
@@ -202,6 +357,8 @@ const Dashboard = ({ subjects, setView, handleStartNew }) => {
 const SubjectList = ({ subjects, setView, handleEdit, handleDelete, exportToExcel, isExporting }) => {
   const [previewData, setPreviewData] = useState(null);
   const [deleteId, setDeleteId] = useState(null);
+
+  const sortedSubjects = [...subjects].sort((a, b) => (a.subjectNo || '').localeCompare(b.subjectNo || '', undefined, { numeric: true }));
 
   const confirmDelete = () => {
     handleDelete(deleteId);
@@ -235,8 +392,6 @@ const SubjectList = ({ subjects, setView, handleEdit, handleDelete, exportToExce
           </div>
           
           <div className="p-6 overflow-y-auto space-y-6 flex-1">
-            
-            {/* 1. 基本資料 */}
             <section>
               <h4 className="font-bold text-gray-500 border-b pb-1 mb-3 text-sm uppercase tracking-wider">基本資料</h4>
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-y-3 gap-x-4 text-sm">
@@ -248,7 +403,6 @@ const SubjectList = ({ subjects, setView, handleEdit, handleDelete, exportToExce
               </div>
             </section>
 
-            {/* 2. ROM */}
             <section>
               <h4 className="font-bold text-gray-500 border-b pb-1 mb-3 text-sm uppercase tracking-wider">關節活動度 (ROM)</h4>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
@@ -257,7 +411,6 @@ const SubjectList = ({ subjects, setView, handleEdit, handleDelete, exportToExce
                 {renderRomRow('被動肩關節 (右側)', subject.rom.passiveRightIR, subject.rom.passiveRightER)}
                 {renderRomRow('被動肩關節 (左側)', subject.rom.passiveLeftIR, subject.rom.passiveLeftER)}
                 
-                {/* 胸椎 */}
                 <div className="bg-white p-2.5 rounded-lg border border-gray-100 shadow-sm md:col-span-2">
                   <div className="font-bold text-gray-700 mb-2">胸椎旋轉 (Thoracic)</div>
                   <div className="flex justify-start gap-8 text-xs text-gray-600">
@@ -268,7 +421,6 @@ const SubjectList = ({ subjects, setView, handleEdit, handleDelete, exportToExce
               </div>
             </section>
 
-            {/* 3. SMRT */}
             <section>
               <h4 className="font-bold text-gray-500 border-b pb-1 mb-3 text-sm uppercase tracking-wider">SMRT 動作控制</h4>
               <div className="text-sm bg-gray-50 p-3 rounded-lg border border-gray-100">
@@ -277,7 +429,6 @@ const SubjectList = ({ subjects, setView, handleEdit, handleDelete, exportToExce
               </div>
             </section>
 
-            {/* 4. 功能測試 */}
             <section>
               <h4 className="font-bold text-gray-500 border-b pb-1 mb-3 text-sm uppercase tracking-wider">功能測試 (Functional)</h4>
               <div className="bg-white p-3 rounded-lg border border-gray-100 shadow-sm space-y-3 text-sm">
@@ -313,7 +464,6 @@ const SubjectList = ({ subjects, setView, handleEdit, handleDelete, exportToExce
               </div>
             </section>
 
-            {/* 5. K-Pull */}
             <section className="bg-blue-50/50 p-4 rounded-xl border border-blue-100">
               <h4 className="font-bold text-blue-800 mb-4 flex items-center gap-2">
                 <Activity size={18}/> K-Pull 測試結果完整預覽 (28項指標)
@@ -423,10 +573,10 @@ const SubjectList = ({ subjects, setView, handleEdit, handleDelete, exportToExce
             </tr>
           </thead>
           <tbody>
-            {subjects.length === 0 && (
+            {sortedSubjects.length === 0 && (
               <tr><td colSpan="6" className="p-8 text-center text-gray-400">尚無資料</td></tr>
             )}
-            {subjects.map(sub => (
+            {sortedSubjects.map(sub => (
               <tr key={sub.id} className="border-b last:border-0 hover:bg-blue-50/50 transition">
                 <td className="p-4 font-medium text-gray-900">{sub.subjectNo || '未填'}</td>
                 <td className="p-4">{sub.name}</td>
@@ -456,7 +606,6 @@ const SubjectList = ({ subjects, setView, handleEdit, handleDelete, exportToExce
       
       {previewData && <PreviewModal subject={previewData} onClose={() => setPreviewData(null)} />}
       
-      {/* 自訂的刪除確認 Modal */}
       {deleteId && (
         <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 p-4 animate-in fade-in">
           <div className="bg-white rounded-2xl shadow-xl w-full max-w-sm overflow-hidden animate-in zoom-in-95 duration-200">
@@ -482,20 +631,28 @@ const SubjectList = ({ subjects, setView, handleEdit, handleDelete, exportToExce
   );
 };
 
-const DomainViewer = ({ currentSubject, setCurrentSubject, handleSave, handleCancel }) => {
+const DomainViewer = ({ currentSubject, setCurrentSubject, handleSave, handleCancel, handleAutoSave }) => {
   const [activeTab, setActiveTab] = useState('basic');
   const questions = React.useMemo(() => getQuestions(currentSubject), [currentSubject.group]);
   const currentDomainQuestions = questions.filter(q => q.domain === activeTab);
 
   const isBasicInfoComplete = (currentSubject.name || '').trim() !== '' && (currentSubject.subjectNo || '').trim() !== '';
 
-  const updateField = (id, val) => setCurrentSubject(prev => ({ ...prev, [id]: val }));
+  const updateField = (id, val) => {
+    setCurrentSubject(prev => {
+      const next = { ...prev, [id]: val };
+      if (handleAutoSave) handleAutoSave(next);
+      return next;
+    });
+  };
   
   const updateTrial = (path, id, idx, val) => {
     setCurrentSubject(prev => {
       const newArr = [...prev[path][id]];
       newArr[idx] = val;
-      return { ...prev, [path]: { ...prev[path], [id]: newArr } };
+      const next = { ...prev, [path]: { ...prev[path], [id]: newArr } };
+      if (handleAutoSave) handleAutoSave(next);
+      return next;
     });
   };
 
@@ -506,19 +663,60 @@ const DomainViewer = ({ currentSubject, setCurrentSubject, handleSave, handleCan
       const part2Keys = ['dyspnea', 'difficulty', 'noReach60', 'humeralAnterior', 'fatigue', 'feedbackNeeded', 'helpNeeded'];
       const part2Score = part2Keys.filter(k => updatedChecklist[k]).length;
       const newResult = (part1Score === 1 || part2Score > 3) ? '陽性' : '陰性';
-      return { ...prev, smrt: { ...prev.smrt, checklist: updatedChecklist, result: newResult } };
+      const next = { ...prev, smrt: { ...prev.smrt, checklist: updatedChecklist, result: newResult } };
+      if (handleAutoSave) handleAutoSave(next);
+      return next;
     });
   };
 
   const handleCsvUpload = async (e, direction) => {
-    const files = Array.from(e.target.files);
-    if (!files.length) return;
+    const file = e.target.files[0];
+    if (!file) return;
     
     const parsedData = {};
     kpullMetricsList.forEach(m => parsedData[m] = []);
     
-    for (let file of files) {
-      try {
+    try {
+      if (file.name.toLowerCase().endsWith('.pdf')) {
+        // --- 處理 PDF 解析 ---
+        if (!window.pdfjsLib) {
+          await new Promise((resolve, reject) => {
+            const script = document.createElement('script');
+            script.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js';
+            script.onload = () => {
+              window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
+              resolve();
+            };
+            script.onerror = reject;
+            document.head.appendChild(script);
+          });
+        }
+
+        const arrayBuffer = await file.arrayBuffer();
+        const pdf = await window.pdfjsLib.getDocument(arrayBuffer).promise;
+        let fullText = "";
+
+        for (let i = 1; i <= pdf.numPages; i++) {
+          const page = await pdf.getPage(i);
+          const textContent = await page.getTextContent();
+          const pageText = textContent.items.map(item => item.str).join(" ");
+          fullText += pageText + "\n";
+        }
+
+        kpullMetricsList.forEach(metric => {
+          const safeMetric = metric.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          const regex = new RegExp(`${safeMetric}\\s*([-+]?[0-9]*\\.?[0-9]+)`, 'g');
+          
+          let match;
+          while ((match = regex.exec(fullText)) !== null) {
+              if (match[1] && parsedData[metric].length < 3) {
+                  parsedData[metric].push(match[1]);
+              }
+          }
+        });
+
+      } else {
+        // --- 處理 CSV 解析 ---
         const text = await file.text();
         const lines = text.split('\n').map(l => l.split(','));
         for (let line of lines) {
@@ -529,9 +727,10 @@ const DomainViewer = ({ currentSubject, setCurrentSubject, handleSave, handleCan
             parsedData[key].push(...vals);
           }
         }
-      } catch (err) {
-        console.error("Error reading file:", err);
       }
+    } catch (err) {
+      console.error("Error reading file:", err);
+      alert("檔案讀取失敗，請確認檔案格式是否正確。");
     }
     
     kpullMetricsList.forEach(m => {
@@ -544,10 +743,9 @@ const DomainViewer = ({ currentSubject, setCurrentSubject, handleSave, handleCan
       kpullMetricsList.forEach(m => {
         newKpull[`${direction}_${m}`] = parsedData[m];
       });
-      return {
-        ...prev,
-        kpull: newKpull
-      };
+      const next = { ...prev, kpull: newKpull };
+      if (handleAutoSave) handleAutoSave(next);
+      return next;
     });
     
     e.target.value = null; 
@@ -707,14 +905,16 @@ const DomainViewer = ({ currentSubject, setCurrentSubject, handleSave, handleCan
                   {/* ER 上傳 */}
                   <div className="bg-orange-50 border-2 border-dashed border-orange-300 p-6 md:p-8 rounded-2xl text-center">
                     <Upload className="mx-auto text-orange-400 mb-4" size={40} />
-                    <h4 className="text-orange-800 font-bold text-xl mb-6">上傳 外轉 (ER) CSV 檔案</h4>
-                    <input type="file" accept=".csv" onChange={(e) => handleCsvUpload(e, 'ER')} className="hidden" id="csv-upload-er" />
+                    <h4 className="text-orange-800 font-bold text-xl mb-6">上傳 外轉 (ER) 數據檔案</h4>
+                    <input type="file" accept=".csv, .pdf" onChange={(e) => handleCsvUpload(e, 'ER')} className="hidden" id="csv-upload-er" />
                     <label htmlFor="csv-upload-er" className="cursor-pointer bg-orange-600 text-white px-8 py-3 rounded-xl shadow-md hover:bg-orange-700 transition font-bold inline-block text-lg">
-                      選擇 ER 檔案
+                      選擇 CSV 或 PDF 檔案
                     </label>
-                    {(currentSubject.kpull['ER_Max Value (kg)'] || currentSubject.kpull.peakForceER || []).filter(v=>v !== '').length > 0 && (
-                      <div className="mt-5 p-3 bg-white rounded-xl inline-block border border-orange-200 shadow-sm animate-in slide-in-from-bottom-2">
-                        <p className="text-sm text-green-600 font-bold">✓ 上傳成功</p>
+                    {currentSubject.kpull['ER_Max Value (kg)'].filter(v=>v !== '').length > 0 && (
+                      <div className="mt-5 p-4 bg-white rounded-xl border border-orange-200 shadow-sm animate-in slide-in-from-bottom-2 text-left text-sm space-y-1">
+                        <div className="text-green-600 font-bold mb-2 text-center">✓ 上傳成功</div>
+                        <div className="text-gray-600 flex justify-between"><span>Max Value Mean:</span> <strong className="text-orange-700">{calcMean(currentSubject.kpull['ER_Max Value (kg)'])} kg</strong></div>
+                        <div className="text-gray-600 flex justify-between"><span>Max Value SD:</span> <strong className="text-orange-700">{calcSD(currentSubject.kpull['ER_Max Value (kg)'])} kg</strong></div>
                       </div>
                     )}
                   </div>
@@ -722,14 +922,16 @@ const DomainViewer = ({ currentSubject, setCurrentSubject, handleSave, handleCan
                   {/* IR 上傳 */}
                   <div className="bg-blue-50 border-2 border-dashed border-blue-300 p-6 md:p-8 rounded-2xl text-center">
                     <Upload className="mx-auto text-blue-400 mb-4" size={40} />
-                    <h4 className="text-blue-800 font-bold text-xl mb-6">上傳 內轉 (IR) CSV 檔案</h4>
-                    <input type="file" accept=".csv" onChange={(e) => handleCsvUpload(e, 'IR')} className="hidden" id="csv-upload-ir" />
+                    <h4 className="text-blue-800 font-bold text-xl mb-6">上傳 內轉 (IR) 數據檔案</h4>
+                    <input type="file" accept=".csv, .pdf" onChange={(e) => handleCsvUpload(e, 'IR')} className="hidden" id="csv-upload-ir" />
                     <label htmlFor="csv-upload-ir" className="cursor-pointer bg-blue-600 text-white px-8 py-3 rounded-xl shadow-md hover:bg-blue-700 transition font-bold inline-block text-lg">
-                      選擇 IR 檔案
+                      選擇 CSV 或 PDF 檔案
                     </label>
-                    {(currentSubject.kpull['IR_Max Value (kg)'] || currentSubject.kpull.peakForceIR || []).filter(v=>v !== '').length > 0 && (
-                      <div className="mt-5 p-3 bg-white rounded-xl inline-block border border-blue-200 shadow-sm animate-in slide-in-from-bottom-2">
-                        <p className="text-sm text-green-600 font-bold">✓ 上傳成功</p>
+                    {currentSubject.kpull['IR_Max Value (kg)'].filter(v=>v !== '').length > 0 && (
+                      <div className="mt-5 p-4 bg-white rounded-xl border border-blue-200 shadow-sm animate-in slide-in-from-bottom-2 text-left text-sm space-y-1">
+                        <div className="text-green-600 font-bold mb-2 text-center">✓ 上傳成功</div>
+                        <div className="text-gray-600 flex justify-between"><span>Max Value Mean:</span> <strong className="text-blue-700">{calcMean(currentSubject.kpull['IR_Max Value (kg)'])} kg</strong></div>
+                        <div className="text-gray-600 flex justify-between"><span>Max Value SD:</span> <strong className="text-blue-700">{calcSD(currentSubject.kpull['IR_Max Value (kg)'])} kg</strong></div>
                       </div>
                     )}
                   </div>
@@ -783,41 +985,84 @@ const DomainViewer = ({ currentSubject, setCurrentSubject, handleSave, handleCan
       <div className="shrink-0 p-4 border-t flex gap-4 bg-white z-30 shadow-[0_-5px_15px_rgba(0,0,0,0.03)]">
         <button 
           onClick={handleCancel}
-          className="flex-1 py-3 sm:py-4 rounded-xl font-bold flex items-center justify-center gap-2 bg-gray-100 text-gray-700 hover:bg-gray-200 transition-colors"
+          className="flex-[1] py-3 sm:py-4 rounded-xl font-bold flex items-center justify-center gap-2 bg-white border border-gray-200 text-gray-700 hover:bg-gray-50 transition-colors"
         >
-          取消返回
+          返回列表
         </button>
         <button 
           onClick={handleSave}
           className="flex-[2] py-3 sm:py-4 rounded-xl font-bold flex items-center justify-center gap-2 bg-green-600 text-white hover:bg-green-700 shadow-md transition-transform active:scale-[0.98]"
         >
-          <Save size={20}/> 儲存並回到列表
+          <Save size={20}/> 完成 (已即時儲存)
         </button>
       </div>
     </div>
   );
 };
 
-// --- Main Application Component ---
 export default function App() {
   const [view, setView] = useState('dashboard');
   const [subjects, setSubjects] = useState([]);
   const [currentSubject, setCurrentSubject] = useState(emptySubject);
   const [isExporting, setIsExporting] = useState(false);
+  
+  const [user, setUser] = useState(null);
+  const [isCloudReady, setIsCloudReady] = useState(false);
 
   useEffect(() => {
-    const saved = localStorage.getItem('tennis_study_data');
-    if (saved) setSubjects(JSON.parse(saved));
+    if (!auth) return;
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch(e) { console.error("Firebase Auth Error:", e); }
+    };
+    initAuth();
+    const unsubscribe = onAuthStateChanged(auth, (u) => setUser(u));
+    return () => unsubscribe();
   }, []);
+
+  useEffect(() => {
+    if (!window.jStat) {
+      const script = document.createElement('script');
+      script.src = 'https://cdnjs.cloudflare.com/ajax/libs/jstat/1.9.6/jstat.min.js';
+      document.head.appendChild(script);
+    }
+
+    if (user && db) {
+      const colRef = collection(db, 'artifacts', appId, 'users', user.uid, 'subjects');
+      const unsubscribe = onSnapshot(colRef, (snapshot) => {
+        const cloudData = snapshot.docs.map(doc => doc.data());
+        setSubjects(cloudData);
+        setIsCloudReady(true);
+      }, (error) => console.error("Firestore sync error:", error));
+      return () => unsubscribe();
+    } else {
+      const saved = localStorage.getItem('tennis_study_data');
+      if (saved) setSubjects(JSON.parse(saved));
+      setIsCloudReady(false);
+    }
+  }, [user]);
 
   useEffect(() => {
     localStorage.setItem('tennis_study_data', JSON.stringify(subjects));
   }, [subjects]);
 
-  const handleStartNew = () => {
+  useEffect(() => {
+    if (view === 'entry' && currentSubject.id) {
+      const cloudSubject = subjects.find(s => s.id === currentSubject.id);
+      if (cloudSubject && JSON.stringify(cloudSubject) !== JSON.stringify(currentSubject)) {
+        setCurrentSubject(cloudSubject);
+      }
+    }
+  }, [subjects, view]);
+
+  const handleStartNew = async () => {
     let maxNum = 0;
     let prefix = '';
-
     subjects.forEach(sub => {
       const match = String(sub.subjectNo || '').match(/^(\D*)(\d+)$/);
       if (match) {
@@ -833,16 +1078,22 @@ export default function App() {
     const nextNum = maxNum + 1;
     const paddedNum = String(nextNum).padStart(3, '0');
     const nextSubjectNo = `${prefix}${paddedNum}`;
-
-    setCurrentSubject({ ...emptySubject, id: Date.now().toString(), subjectNo: nextSubjectNo });
+    const newSubject = { ...emptySubject, id: Date.now().toString(), subjectNo: nextSubjectNo };
+    setCurrentSubject(newSubject);
+    
+    if (user && db) {
+      try {
+        const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'subjects', newSubject.id);
+        await setDoc(docRef, newSubject);
+      } catch (e) { console.error("Init document failed", e); }
+    } else {
+      setSubjects(prev => [...prev, newSubject]);
+    }
     setView('entry');
   };
 
   const handleEdit = (sub) => {
-    if (sub.smrt && sub.smrt.checklist && sub.smrt.checklist.helpNeeded === undefined) {
-      sub.smrt.checklist.helpNeeded = false;
-    }
-    
+    if (sub.smrt && sub.smrt.checklist && sub.smrt.checklist.helpNeeded === undefined) sub.smrt.checklist.helpNeeded = false;
     if (sub.kpull && !sub.kpull['ER_Max Value (kg)']) {
       kpullMetricsList.forEach(m => {
         if (!sub.kpull[`ER_${m}`]) sub.kpull[`ER_${m}`] = ['', '', ''];
@@ -851,26 +1102,62 @@ export default function App() {
       if (sub.kpull.peakForceER) sub.kpull['ER_Max Value (kg)'] = sub.kpull.peakForceER;
       if (sub.kpull.peakForceIR) sub.kpull['IR_Max Value (kg)'] = sub.kpull.peakForceIR;
     }
-
-    if (!sub.gender) {
-      sub.gender = '男性';
-    }
-
+    if (!sub.gender) sub.gender = '男性';
     setCurrentSubject(sub);
     setView('entry');
   };
 
-  const handleDelete = (id) => {
-    setSubjects(subjects.filter(s => s.id !== id));
+  const handleDelete = async (id) => {
+    try {
+      if (user && db) {
+        const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'subjects', id);
+        await deleteDoc(docRef);
+      } else {
+        setSubjects(subjects.filter(s => s.id !== id));
+      }
+    } catch (error) {
+      console.error("Delete failed, fallback to local:", error);
+      setSubjects(subjects.filter(s => s.id !== id));
+    }
   };
 
-  const saveSubject = () => {
-    setSubjects(prev => {
-      const exists = prev.find(s => s.id === currentSubject.id);
-      if (exists) return prev.map(s => s.id === currentSubject.id ? currentSubject : s);
-      return [...prev, currentSubject];
-    });
-    setView('dashboard');
+  const handleAutoSave = async (updatedSubject) => {
+    if (user && db) {
+      try {
+        const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'subjects', updatedSubject.id);
+        await setDoc(docRef, updatedSubject, { merge: true });
+      } catch (error) { console.error("AutoSave failed:", error); }
+    } else {
+      setSubjects(prev => {
+        const exists = prev.find(s => s.id === updatedSubject.id);
+        if (exists) return prev.map(s => s.id === updatedSubject.id ? updatedSubject : s);
+        return [...prev, updatedSubject];
+      });
+    }
+  };
+
+  const saveSubject = async () => {
+    try {
+      if (user && db) {
+        const docRef = doc(db, 'artifacts', appId, 'users', user.uid, 'subjects', currentSubject.id);
+        await setDoc(docRef, currentSubject);
+      } else {
+        setSubjects(prev => {
+          const exists = prev.find(s => s.id === currentSubject.id);
+          if (exists) return prev.map(s => s.id === currentSubject.id ? currentSubject : s);
+          return [...prev, currentSubject];
+        });
+      }
+    } catch (error) {
+      console.error("Save failed, fallback to local:", error);
+      setSubjects(prev => {
+        const exists = prev.find(s => s.id === currentSubject.id);
+        if (exists) return prev.map(s => s.id === currentSubject.id ? currentSubject : s);
+        return [...prev, currentSubject];
+      });
+    } finally {
+      setView('dashboard');
+    }
   };
 
   const exportToExcel = async () => {
@@ -878,7 +1165,6 @@ export default function App() {
     setIsExporting(true);
 
     try {
-      // 動態載入支援樣式設定的 SheetJS 套件 (xlsx-js-style)
       if (!window.XLSX) {
         await new Promise((resolve, reject) => {
           const script = document.createElement('script');
@@ -891,22 +1177,15 @@ export default function App() {
 
       const XLSX = window.XLSX;
       const dateStr = new Date().toISOString().split('T')[0];
-
-      // 處理 SPSS 標題：移除特殊字元與空格
       const sanitizeHeader = (str) => str.replace(/[^a-zA-Z0-9]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
-
-      // 處理數值：將中文類別翻譯為數字編碼 (SPSS友善)
       const translateGender = (g) => g === '女性' ? 0 : 1;
       const translateHand = (h) => h === '左' ? 1 : 0;
       const translateGroup = (g) => {
         if (g === '肩峰下疼痛組') return 1;
         if (g === '肩痛病史組') return 3;
-        return 0; // 健康組
+        return 0; 
       };
 
-      // ==========================================
-      // 1. 產生與下載扁平化 CSV (全部資料都在同一表，相容最基礎匯入)
-      // ==========================================
       const flattenSubject = (sub) => {
         const flat = {
           'SystemID': sub.id,
@@ -999,13 +1278,9 @@ export default function App() {
       const csvLink = document.createElement('a');
       csvLink.href = URL.createObjectURL(csvBlob);
       csvLink.download = `Tennis_Clinical_Data_${dateStr}.csv`;
-      
-      // 觸發 CSV 下載
       csvLink.click();
 
-      // ==========================================
-      // 2. 產生與下載多頁籤 Excel (.xlsx) 並為 Mean/SD 上色
-      // ==========================================
+      // Excel (Multi-Sheet)
       const wb = XLSX.utils.book_new();
 
       const addTrialsToRow = (obj, prefix, arr) => {
@@ -1014,7 +1289,6 @@ export default function App() {
         obj[`${prefix}_SD`] = calcSD(arr) || '';
       };
 
-      // 分頁 1: 基本資料
       const basicSheetData = subjects.map(sub => ({
         'SubjectID': sub.subjectNo, 'Name': sub.name, 'Gender': translateGender(sub.gender),
         'Age': sub.age, 'Height_cm': sub.height, 'Weight_kg': sub.weight,
@@ -1024,7 +1298,6 @@ export default function App() {
       }));
       XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(basicSheetData), "BasicInfo");
 
-      // 分頁 2: ROM
       const romSheetData = subjects.map(sub => {
         const row = { 'SubjectID': sub.subjectNo, 'Name': sub.name };
         Object.entries(sub.rom).forEach(([key, arr]) => addTrialsToRow(row, `ROM_${key}`, arr));
@@ -1034,7 +1307,6 @@ export default function App() {
       });
       XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(romSheetData), "ROM");
 
-      // 分頁 3: SMRT
       const smrtSheetData = subjects.map(sub => {
         const row = { 'SubjectID': sub.subjectNo, 'Name': sub.name };
         row['SMRT_Result'] = sub.smrt.result === '陽性' ? 1 : 0;
@@ -1043,7 +1315,6 @@ export default function App() {
       });
       XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(smrtSheetData), "SMRT");
 
-      // 分頁 4: 功能測試
       const funcSheetData = subjects.map(sub => {
         const row = { 'SubjectID': sub.subjectNo, 'Name': sub.name };
         const armLen = Number(sub.armLength);
@@ -1067,7 +1338,6 @@ export default function App() {
       });
       XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(funcSheetData), "Functional");
 
-      // 分頁 5: K-Pull
       const kpullSheetData = subjects.map(sub => {
         const row = { 'SubjectID': sub.subjectNo, 'Name': sub.name, 'Weight_kg': sub.weight };
         kpullMetricsList.forEach(m => {
@@ -1090,7 +1360,6 @@ export default function App() {
       });
       XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(kpullSheetData), "KPull");
 
-      // 針對 Excel 檔進行自動上色處理
       const styleSheetWithColors = (ws) => {
         if (!ws['!ref']) return;
         const range = XLSX.utils.decode_range(ws['!ref']);
@@ -1102,7 +1371,6 @@ export default function App() {
           const headerStr = String(headerCell.v);
           let bgColor = null;
           
-          // 判定如果欄位標題含有 _Mean 則為淡綠色, 含 _SD 則為淡粉紅色
           if (headerStr.includes('_Mean')) bgColor = 'D9EAD3';
           else if (headerStr.includes('_SD')) bgColor = 'F4CCCC';
 
@@ -1112,24 +1380,19 @@ export default function App() {
               if (!ws[cellRef]) continue;
               ws[cellRef].s = {
                 fill: { fgColor: { rgb: bgColor } },
-                font: { bold: R === 0 } // 第一列維持粗體
+                font: { bold: R === 0 }
               };
             }
           } else {
-            // 普通標題也加上粗體
-            if (ws[headerCellRef]) {
-               ws[headerCellRef].s = { font: { bold: true } };
-            }
+            if (ws[headerCellRef]) ws[headerCellRef].s = { font: { bold: true } };
           }
         }
       };
 
-      // 對五個分頁分別執行上色
       ['BasicInfo', 'ROM', 'SMRT', 'Functional', 'KPull'].forEach(sheetName => {
         if (wb.Sheets[sheetName]) styleSheetWithColors(wb.Sheets[sheetName]);
       });
 
-      // 下載 Excel (稍微延遲以防瀏覽器阻擋多檔下載)
       setTimeout(() => {
         XLSX.writeFile(wb, `Tennis_Clinical_Data_${dateStr}.xlsx`);
       }, 800);
@@ -1144,19 +1407,28 @@ export default function App() {
 
   return (
     <div className="min-h-[100dvh] bg-gray-100 text-gray-900 font-sans p-0 md:p-8 flex flex-col">
-      <div className="max-w-4xl mx-auto w-full flex-1 flex flex-col min-h-0">
+      <div className="max-w-5xl mx-auto w-full flex-1 flex flex-col min-h-0">
+        
+        {view !== 'entry' && isCloudReady && (
+          <div className="text-xs font-bold text-blue-600 bg-blue-100 py-1.5 px-3 rounded-b-lg mb-2 inline-flex items-center gap-1.5 self-end">
+            <CloudIcon size={14} /> 雲端即時同步中
+          </div>
+        )}
+
         {view === 'entry' && (
           <div className="bg-white p-4 shadow-sm border-b md:rounded-t-2xl flex justify-between items-center shrink-0">
             <span className="font-bold text-gray-800 bg-gray-100 px-3 py-1.5 rounded-full text-sm flex items-center gap-2">
               <Users size={16} className="text-blue-600"/>
               {currentSubject.name || '新受試者'} ({currentSubject.subjectNo || '未編號'})
             </span>
+            {isCloudReady && <CloudIcon size={20} className="text-blue-500 opacity-70" />}
           </div>
         )}
 
         <div className={`flex-1 flex flex-col md:bg-white md:shadow-md md:rounded-b-2xl md:border md:border-t-0 min-h-0 ${view === 'entry' ? 'p-0 md:p-8' : 'p-4 md:p-8'}`}>
           {view === 'dashboard' && <Dashboard subjects={subjects} setView={setView} handleStartNew={handleStartNew} />}
           {view === 'list' && <SubjectList subjects={subjects} setView={setView} handleEdit={handleEdit} handleDelete={handleDelete} exportToExcel={exportToExcel} isExporting={isExporting} />}
+          {view === 'analysis' && <AnalysisView subjects={subjects} setView={setView} />}
           
           {view === 'entry' && (
             <DomainViewer
@@ -1164,6 +1436,7 @@ export default function App() {
               setCurrentSubject={setCurrentSubject}
               handleSave={saveSubject}
               handleCancel={() => setView('dashboard')}
+              handleAutoSave={handleAutoSave}
             />
           )}
         </div>
